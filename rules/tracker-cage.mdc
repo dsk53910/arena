@@ -1,0 +1,16 @@
+---
+description: Tracker cage. Apply in tracker sessions and when /tracker is invoked.
+alwaysApply: false
+---
+
+# Tracker cage
+
+You are a tracker in an Arena run.
+
+- CWD is your worktree. Stay there.
+- Branch is `run/<task>/<you>`. Commit only here.
+- First action: `scripts/arena prompt next --task <task> --me <you>`. That mail **is** the prompt.
+- If blocked, `prompt send --type question --to o1`.
+- Rubric clarification only: `prompt send --type rubric-q --to o2`.
+- When done: write `RESULT.md` from the template, commit, `prompt send --type result --to o2`.
+- Never checkout `main`, never fetch another `run/*` for content, never edit `TASK.md` / `RUBRIC.md` on the arena branch.

@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# Arena CLI — mutate arena/*, run/*, mail/* without checking out the caller's tree.
+set -e
+set -o pipefail
+
+die() {
+  echo "arena: $*" >&2
+  exit 1
+}
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PLUGIN_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+
+# shellcheck source=lib/git.sh
+. "$SCRIPT_DIR/lib/git.sh"
+# shellcheck source=lib/msg.sh
+. "$SCRIPT_DIR/lib/msg.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: arena <command> [options]
+
+Commands:
+  arena-create   --task ID [--from-ref REF] [--task-file PATH] [--rubric-file PATH]
+  spawn          --task ID --tracker ID [--worktree PATH]
+  prompt pack    --task ID --to ROLE [--from ROLE] [--body-file PATH | --body TEXT]
+  prompt next    --task ID --me ROLE
+  prompt send    --task ID --from ROLE --to ROLE --type TYPE [--body-file PATH | --body TEXT]
+  collect        --task ID
+  status         --task ID
+  help
+
+Mail types: arena-ready | pack | question | reply | result | rubric-q | rubric-a
+Roles: o1 | o2 | <tracker-id> | all (to= only)
+
+Git layout in the target repo:
+  arena/<task>          orphan baseline (O2)
+  run/<task>/<tracker>  worktree branch from arena
+  mail/<task>           orphan messages (CLI only)
+EOF
+}
+
+need_repo() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "run this inside a git repository (the task repo, not necessarily the plugin)"
+}
+
+arg() {
+  # sets globals from remaining "$@"
+  TASK=""
+  TRACKER=""
+  FROM=""
+  TO=""
+  ME=""
+  TYPE=""
+  FROM_REF="HEAD"
+  TASK_FILE=""
+  RUBRIC_FILE=""
+  BODY_FILE=""
+  BODY=""
+  WORKTREE=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --task)
+        TASK=$2
+        shift 2
+        ;;
+      --tracker)
+        TRACKER=$2
+        shift 2
+        ;;
+      --from)
+        FROM=$2
+        shift 2
+        ;;
+      --to)
+        TO=$2
+        shift 2
+        ;;
+      --me)
+        ME=$2
+        shift 2
+        ;;
+      --type)
+        TYPE=$2
+        shift 2
+        ;;
+      --from-ref)
+        FROM_REF=$2
+        shift 2
+        ;;
+      --task-file)
+        TASK_FILE=$2
+        shift 2
+        ;;
+      --rubric-file)
+        RUBRIC_FILE=$2
+        shift 2
+        ;;
+      --body-file)
+        BODY_FILE=$2
+        shift 2
+        ;;
+      --body)
+        BODY=$2
+        shift 2
+        ;;
+      --worktree)
+        WORKTREE=$2
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+  done
+}
+
+need_task() {
+  [ -n "$TASK" ] || die "--task is required"
+  TASK=$(arena_sanitize "$TASK")
+  [ -n "$TASK" ] || die "empty --task"
+}
+
+body_to_file() {
+  if [ -n "$BODY_FILE" ]; then
+    [ -f "$BODY_FILE" ] || die "missing --body-file $BODY_FILE"
+    echo "$BODY_FILE"
+    return
+  fi
+  if [ -n "$BODY" ]; then
+    local tmp
+    tmp=$(mktemp -t arena-body)
+    printf '%s\n' "$BODY" >"$tmp"
+    echo "$tmp"
+    return
+  fi
+  echo ""
+}
+
+cmd_arena_create() {
+  need_repo
+  need_task
+  local tf rf tmpdir
+  tmpdir=$(mktemp -d -t arena-create)
+  if [ -n "$TASK_FILE" ]; then
+    tf=$TASK_FILE
+  else
+    tf="$tmpdir/TASK.md"
+    arena_fill_template "$PLUGIN_ROOT/templates/TASK.md" "$tf" "$TASK"
+  fi
+  if [ -n "$RUBRIC_FILE" ]; then
+    rf=$RUBRIC_FILE
+  else
+    rf="$tmpdir/RUBRIC.md"
+    arena_fill_template "$PLUGIN_ROOT/templates/RUBRIC.md" "$rf" "$TASK"
+  fi
+  arena_commit_orphan_from "arena/$TASK" "$FROM_REF" "TASK.md=$tf" "RUBRIC.md=$rf"
+  rm -rf "$tmpdir"
+  echo "created arena/$TASK from $FROM_REF"
+}
+
+cmd_spawn() {
+  need_repo
+  need_task
+  [ -n "$TRACKER" ] || die "--tracker is required"
+  TRACKER=$(arena_sanitize "$TRACKER")
+  local path
+  if [ -n "$WORKTREE" ]; then
+    path=$WORKTREE
+  else
+    path=$(arena_default_worktree "$TASK" "$TRACKER")
+  fi
+  arena_spawn_run "$TASK" "$TRACKER" "$path"
+  echo "created run/$TASK/$TRACKER"
+  echo "worktree $path"
+}
+
+cmd_prompt_pack() {
+  need_repo
+  need_task
+  [ -n "$TO" ] || die "--to is required"
+  FROM=${FROM:-o1}
+  local bf tmp
+  bf=$(body_to_file)
+  if [ -z "$bf" ]; then
+    arena_ref_exists "arena/$TASK" || die "missing arena/$TASK"
+    tmp=$(mktemp -t arena-pack)
+    {
+      echo "# Pack for $TO"
+      echo
+      echo "Work only on run/$TASK/$TO in this worktree."
+      echo "Send result mail when done. Rubric questions: type rubric-q to o2."
+      echo
+      git show "arena/$TASK:TASK.md"
+    } >"$tmp"
+    bf=$tmp
+  fi
+  local id
+  id=$(arena_prompt_send "$TASK" "$FROM" "$TO" "pack" "$bf")
+  [ "$bf" = "$BODY_FILE" ] || rm -f "$bf"
+  echo "packed $id -> $TO"
+}
+
+cmd_prompt_send() {
+  need_repo
+  need_task
+  [ -n "$FROM" ] || die "--from is required"
+  [ -n "$TO" ] || die "--to is required"
+  [ -n "$TYPE" ] || die "--type is required"
+  local bf
+  bf=$(body_to_file)
+  [ -n "$bf" ] || die "provide --body or --body-file"
+  local id
+  id=$(arena_prompt_send "$TASK" "$FROM" "$TO" "$TYPE" "$bf")
+  [ "$bf" = "$BODY_FILE" ] || rm -f "$bf"
+  echo "sent $id"
+}
+
+cmd_prompt_next() {
+  need_repo
+  need_task
+  [ -n "$ME" ] || die "--me is required"
+  if ! arena_prompt_next "$TASK" "$ME"; then
+    echo "arena: no unread mail for $ME on mail/$TASK" >&2
+    exit 2
+  fi
+}
+
+cmd_collect() {
+  need_repo
+  need_task
+  arena_ref_exists "arena/$TASK" || die "missing arena/$TASK"
+  echo "## arena/$TASK"
+  git log -1 --oneline "arena/$TASK"
+  echo
+  git for-each-ref --format='%(refname:short)' "refs/heads/run/$TASK/" | while read -r br; do
+    echo "## $br"
+    git log --oneline "arena/$TASK..$br" || true
+    echo "--- diffstat vs arena ---"
+    git diff --stat "arena/$TASK...$br" || true
+    echo
+  done
+  if arena_ref_exists "mail/$TASK"; then
+    echo "## mail/$TASK"
+    arena_ls_mail_ids "mail/$TASK" | while read -r id; do
+      [ -n "$id" ] || continue
+      echo "$id"
+    done
+  fi
+}
+
+cmd_status() {
+  need_repo
+  need_task
+  echo "task $TASK"
+  if arena_ref_exists "arena/$TASK"; then
+    echo "arena  $(git rev-parse --short "arena/$TASK")"
+  else
+    echo "arena  (missing)"
+  fi
+  git for-each-ref --format='run    %(refname:short) %(objectname:short)' "refs/heads/run/$TASK/"
+  if arena_ref_exists "mail/$TASK"; then
+    echo "mail   $(git rev-parse --short "mail/$TASK") messages:$(arena_ls_mail_ids "mail/$TASK" | grep -c . || true)"
+  else
+    echo "mail   (missing)"
+  fi
+}
+
+[ $# -gt 0 ] || { usage; exit 1; }
+
+cmd=$1
+shift
+case $cmd in
+  help|-h|--help)
+    usage
+    ;;
+  arena-create)
+    arg "$@"
+    cmd_arena_create
+    ;;
+  spawn)
+    arg "$@"
+    cmd_spawn
+    ;;
+  prompt)
+    [ $# -gt 0 ] || die "prompt needs pack|next|send"
+    sub=$1
+    shift
+    arg "$@"
+    case $sub in
+      pack) cmd_prompt_pack ;;
+      next) cmd_prompt_next ;;
+      send) cmd_prompt_send ;;
+      *) die "unknown prompt subcommand: $sub" ;;
+    esac
+    ;;
+  collect)
+    arg "$@"
+    cmd_collect
+    ;;
+  status)
+    arg "$@"
+    cmd_status
+    ;;
+  *)
+    die "unknown command: $cmd"
+    ;;
+esac

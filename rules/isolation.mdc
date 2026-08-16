@@ -1,0 +1,16 @@
+---
+description: Isolation invariants for Arena tasks. Apply when working with arena/*, run/*, mail/* branches or /o1-spawn /o2-arena /o2-judge /tracker.
+alwaysApply: false
+---
+
+# Arena isolation
+
+These rules apply when the current repository has `arena/*`, `run/*`, or `mail/*` branches, or when an Arena command/skill is in use.
+
+- Do not commit to `main` (or the product default branch).
+- Do not rewrite `arena/<task>`. Only O2 creates it, via `scripts/arena arena-create`.
+- A tracker may write only `run/<task>/<their-id>` in their worktree.
+- Do not read another tracker's `run/<task>/*` branch, worktree, or RESULT.
+- Do not put mail files into a tracker working tree. Mail is `mail/<task>` via `scripts/arena prompt *` only.
+- Do not merge run branches into `main`. Export is a human decision after O2 judge.
+- Do not use Cursor `/best-of-n` as a substitute for O2 judge.

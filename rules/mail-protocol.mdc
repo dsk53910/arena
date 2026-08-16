@@ -1,0 +1,24 @@
+---
+description: Arena mail protocol. Apply when passing prompts or talking between O1, O2, and trackers.
+alwaysApply: false
+---
+
+# Arena mail
+
+Cross-session prompts and talk go through git branch `mail/<task>`, never through paste between chats.
+
+Use only:
+
+```text
+scripts/arena prompt pack --task ID --to ROLE
+scripts/arena prompt next --task ID --me ROLE
+scripts/arena prompt send --task ID --from ROLE --to ROLE --type TYPE --body TEXT
+```
+
+Allowed types: `arena-ready`, `pack`, `question`, `reply`, `result`, `rubric-q`, `rubric-a`.
+
+- `prompt next` is the session's incoming prompt. Do not wait for the human to paste a brief.
+- Tracker → O2 mid-run: only `rubric-q` (clarify TASK/RUBRIC boundaries). No "how should I implement X".
+- O2 `rubric-a`: restates constraints. No solution hints.
+- Tracker → O2 for scoring: only sealed `result` after work is committed.
+- Trackers do not message each other. O1 may relay a sanitized excerpt.
